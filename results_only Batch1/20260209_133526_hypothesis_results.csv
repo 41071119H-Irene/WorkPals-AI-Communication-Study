@@ -1,0 +1,5 @@
+﻿analysis,x,m,y,effect,estimate,ci_low_95,ci_high_95,n_used,n_boot,dv,term,coef,se,pvalue
+mediation,groupA,d_stai_post,d_ps_post,indirect_ab,0.029701189981562685,-0.0494465126058778,0.1942468589341425,46,5000.0,,,,,
+moderation,,,,,,,,46,,d_comm_post,groupA,-1.5946866104154491,0.8948572864610207,0.08197068611864046
+moderation,,,,,,,,46,,d_comm_post,trust_ai_pre,-0.42757748260594547,0.18953851227706778,0.029344990843223832
+moderation,,,,,,,,46,,d_comm_post,groupA:trust_ai_pre,0.46978146853795066,0.25727582897060874,0.07496754789321297

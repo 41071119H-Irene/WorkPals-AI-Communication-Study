@@ -15,7 +15,7 @@ import statsmodels.formula.api as smf
 # =========================
 # Config
 # =========================
-DEFAULT_XLSX_PATH = "data_batch1.xlsx"
+DEFAULT_XLSX_PATH = "data_all.xlsx"
 RESULTS_DIR = "results"
 
 LIKERT5_MAP = {
