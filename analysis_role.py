@@ -26,7 +26,6 @@ LIKERT5_MAP = {
     "-": np.nan,
 }
 
-# 忽略 pandas 的某些警告以保持 console 乾淨
 warnings.filterwarnings(
     "ignore",
     message="The default of observed=False is deprecated",
@@ -106,7 +105,6 @@ def score_scales(df: pd.DataFrame, comm_cols, ps_cols, stai_cols, trust_cols, ps
     out = df.copy()
     cols_to_num = [c for c in comm_cols+ps_cols+stai_cols+trust_cols if c in out.columns]
     for c in cols_to_num: out[c] = to_likert_numeric(out[c])
-    
     for c in [c for c in ps_reverse if c in out.columns]: out[c] = 6 - out[c]
     for c in [c for c in stai_reverse if c in out.columns]: out[c] = 6 - out[c]
 
@@ -118,7 +116,6 @@ def score_scales(df: pd.DataFrame, comm_cols, ps_cols, stai_cols, trust_cols, ps
     out["psych_safety"] = out[[c for c in ps_cols if c in out.columns]].apply(lambda r: row_mean_with_min(r, 4), axis=1)
     out["stai6"] = out[[c for c in stai_cols if c in out.columns]].apply(lambda r: row_mean_with_min(r, 3), axis=1)
     out["trust_ai"] = out[[c for c in trust_cols if c in out.columns]].apply(lambda r: row_mean_with_min(r, 3), axis=1)
-    
     return out
 
 # =========================
@@ -151,13 +148,10 @@ def fit_repeated_model(long_df, outcome, warnings_bucket):
     df = long_df.dropna(subset=[outcome, "group", "time", "id"]).copy()
     df["time"] = pd.Categorical(df["time"], categories=["pre", "post", "delay"], ordered=True)
     df["group"] = pd.Categorical(df["group"], categories=["A", "B"], ordered=True)
-    
     cnt = df.groupby("id")[outcome].count()
     df = df[df["id"].isin(cnt[cnt >= 2].index)].copy()
-    
     formula = f"{outcome} ~ C(group, Treatment(reference='A')) * C(time, Treatment(reference='pre'))"
     methods = ["lbfgs", "powell", "cg", "nm"]
-    
     for m in methods:
         try:
             model = smf.mixedlm(formula, data=df, groups=df["id"], re_formula="1")
@@ -165,22 +159,49 @@ def fit_repeated_model(long_df, outcome, warnings_bucket):
             return "MixedLM", res, df, {"optimizer": m, "n_obs": int(res.nobs), "n_subjects": df["id"].nunique()}
         except Exception as e:
             warnings_bucket.append(f"MixedLM({outcome},{m}) 失敗: {e}")
-    
-    # 備用方案 GEE
     gee = smf.gee(formula, groups="id", data=df, cov_struct=sm.cov_struct.Exchangeable(), family=sm.families.Gaussian()).fit()
     return "GEE", gee, df, {"optimizer": "NA", "n_obs": int(gee.nobs), "n_subjects": df["id"].nunique()}
 
 # =========================
-# Plotting (4 Lines)
+# Plotting (Optimized Colors & Styles)
 # =========================
 def plot_means_plotly(long_df, outcome, title, filename_stub, results_dir, run_tag):
-    # 清洗身分別資料
+    # 1. 定義英文圖例名稱
+    LEGEND_MAP = {
+        "A_在學實習生": "Exp: Student Intern",
+        "A_職場新鮮人": "Exp: Early Career",
+        "B_在學實習生": "Ctrl: Student Intern",
+        "B_職場新鮮人": "Ctrl: Early Career"
+    }
+
+    # 2. 定義顏色映射 (實驗組深色/控制組淺色；新鮮人紅/實習生藍)
+    COLOR_MAP = {
+        "Exp: Early Career": "#B22222",      # 深紅 (Firebrick)
+        "Ctrl: Early Career": "#FF6B6B",     # 淺紅
+        "Exp: Student Intern": "#191970",    # 深藍 (Midnight Blue)
+        "Ctrl: Student Intern": "#74C0FC"    # 淺藍
+    }
+
+    # 3. 定義線條樣式映射 (新鮮人實線/實習生虛線)
+    DASH_MAP = {
+        "Exp: Early Career": "solid",
+        "Ctrl: Early Career": "solid",
+        "Exp: Student Intern": "dash",
+        "Ctrl: Student Intern": "dash"
+    }
+    
+    Y_LABEL_MAP = {
+        "psych_safety": "Psychological Safety Score",
+        "stai6": "State Anxiety Score (STAI-6)",
+        "comm_eff": "Communication Self-Efficacy Score"
+    }
+
     df = long_df.dropna(subset=[outcome, "group", "role"]).copy()
     df["role"] = df["role"].astype(str).str.strip()
     df = df[df["role"].isin(["在學實習生", "職場新鮮人"])].copy()
     
     if df.empty:
-        log(f"⚠️ 警告: {outcome} 在過濾身分後沒有資料可繪圖")
+        log(f"⚠️ Warning: No data for {outcome} after filtering.")
         return None, {}
 
     df["time"] = pd.Categorical(df["time"], categories=["pre", "post", "delay"], ordered=True)
@@ -192,18 +213,32 @@ def plot_means_plotly(long_df, outcome, title, filename_stub, results_dir, run_t
           .reset_index()
     )
     summary["se"] = summary["std"] / np.sqrt(summary["count"])
+    summary["Legend"] = summary["group_role"].map(LEGEND_MAP)
 
     fig = px.line(
         summary,
         x="time",
         y="mean",
-        color="group_role",
+        color="Legend",
+        line_dash="Legend",
+        color_discrete_map=COLOR_MAP, # 套用自定義顏色
+        line_dash_map=DASH_MAP,       # 套用自定義實虛線
         error_y="se",
         markers=True,
         title=title,
-        line_dash="group_role" 
+        category_orders={"Legend": ["Exp: Early Career", "Ctrl: Early Career", "Exp: Student Intern", "Ctrl: Student Intern"]}
     )
-    fig.update_layout(xaxis_title="測量時間點", yaxis_title=outcome, legend_title="組別與身分")
+    
+    fig.update_layout(
+        xaxis_title="Time Point", 
+        yaxis_title=Y_LABEL_MAP.get(outcome, outcome), 
+        legend_title="Group & Status",
+        font=dict(family="Arial", size=13),
+        # 加強背景對比度
+        plot_bgcolor="white"
+    )
+    fig.update_xaxes(showgrid=True, gridcolor='lightgray')
+    fig.update_yaxes(showgrid=True, gridcolor='lightgray')
 
     fig_paths = save_plotly(fig, results_dir, run_tag, filename_stub)
     return summary, fig_paths
@@ -214,8 +249,6 @@ def plot_means_plotly(long_df, outcome, title, filename_stub, results_dir, run_t
 def main(xlsx_path: str):
     ensure_dir(RESULTS_DIR)
     run_tag = make_run_tag()
-    manifest_rows, warnings_bucket = [], []
-
     log(f"開始分析... 執行標籤: {run_tag}")
 
     log("Step 1/7 讀取 Excel 分頁...")
@@ -228,7 +261,6 @@ def main(xlsx_path: str):
         log(f"❌ 讀取 Excel 失敗: {e}")
         return
 
-    # 清洗與辨識背景
     bg = keep_valid_ids(bg, "編號 (A實驗組；B控制組)").rename(columns={"編號 (A實驗組；B控制組)": "id", "身分別": "role"})
     bg["group"] = bg["id"].apply(extract_group)
     pre, post, delay = keep_valid_ids(pre, "id"), keep_valid_ids(post, "id"), keep_valid_ids(delay, "id")
@@ -246,7 +278,7 @@ def main(xlsx_path: str):
     post_s = score_scales(post, comm_cols, ps_cols, stai_cols, trust_cols, ps_reverse, stai_reverse)
     delay_s = score_scales(delay, comm_cols, ps_cols, stai_cols, trust_cols, ps_reverse, stai_reverse)
 
-    log("Step 4/7 信度分析 (Cronbach alpha)...")
+    log("Step 4/7 信度分析...")
     reli = pd.DataFrame([
         {"scale": "comm_eff", "alpha": cronbach_alpha(pre_s[[c for c in comm_cols if c in pre_s.columns]])},
         {"scale": "psych_safety", "alpha": cronbach_alpha(pre_s[[c for c in ps_cols if c in pre_s.columns]])},
@@ -255,7 +287,7 @@ def main(xlsx_path: str):
     ])
     save_df(reli, RESULTS_DIR, run_tag, "reliability_pre.csv")
 
-    log("Step 5/7 資料合併與轉換...")
+    log("Step 5/7 資料合併...")
     def to_long(df, t):
         k = df[["id", "comm_eff", "psych_safety", "stai6", "trust_ai"]].copy()
         k["time"] = t
@@ -266,8 +298,8 @@ def main(xlsx_path: str):
     long_df = long_df[long_df["group"].isin(["A", "B"])].copy()
     save_df(long_df, RESULTS_DIR, run_tag, "long_df.csv")
 
-    log("Step 6/7 執行統計模型 (MixedLM)...")
-    all_models = []
+    log("Step 6/7 執行統計模型...")
+    all_models, warnings_bucket = [], []
     for outcome in ["stai6", "psych_safety", "comm_eff"]:
         try:
             mtype, res, _, meta = fit_repeated_model(long_df, outcome, warnings_bucket)
@@ -278,11 +310,11 @@ def main(xlsx_path: str):
     if all_models:
         save_df(pd.concat(all_models), RESULTS_DIR, run_tag, "models.csv")
 
-    log("Step 7/7 產生身分細分圖表 (4 Lines)...")
+    log("Step 7/7 產生視覺化圖表...")
     for outcome, title, stub in [
-        ("psych_safety", "心理安全感 (組別 x 身分)", "fig_ps_detailed"),
-        ("stai6", "焦慮感 (組別 x 身分)", "fig_stai_detailed"),
-        ("comm_eff", "溝通效能 (組別 x 身分)", "fig_comm_detailed"),
+        ("psych_safety", "Psychological Safety across Time by Group & Status", "fig_psafety_by_group_time"),
+        ("stai6", "State Anxiety (STAI-6) across Time by Group & Status", "fig_stai6_by_group_time"),
+        ("comm_eff", "Communication Self-Efficacy across Time by Group & Status", "fig_comm_by_group_time"),
     ]:
         plot_means_plotly(long_df, outcome, title, stub, RESULTS_DIR, run_tag)
 
