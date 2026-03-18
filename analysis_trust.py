@@ -1,0 +1,348 @@
+import argparse
+import os
+import re
+import warnings
+from datetime import datetime
+from typing import Dict, List, Tuple, Any, Optional
+
+import numpy as np
+import pandas as pd
+import plotly.express as px
+import statsmodels.api as sm
+import statsmodels.formula.api as smf
+
+# =========================
+# Config
+# =========================
+DEFAULT_XLSX_PATH = "data_all.xlsx"
+RESULTS_DIR = "results"
+
+LIKERT5_MAP = {
+    "非常不同意": 1,
+    "不同意": 2,
+    "普通": 3,
+    "同意": 4,
+    "非常同意": 5,
+    "-": np.nan,
+}
+
+warnings.filterwarnings(
+    "ignore",
+    message="The default of observed=False is deprecated",
+    category=FutureWarning
+)
+
+# =========================
+# Logging & Helpers
+# =========================
+def log(msg: str) -> None:
+    ts = datetime.now().strftime("%H:%M:%S")
+    print(f"[{ts}] {msg}")
+
+def ensure_dir(path: str) -> None:
+    os.makedirs(path, exist_ok=True)
+
+def make_run_tag() -> str:
+    return datetime.now().strftime("%Y%m%d_%H%M%S")
+
+def outpath(results_dir: str, run_tag: str, name: str) -> str:
+    return os.path.join(results_dir, f"{run_tag}_{name}")
+
+def save_df(df: pd.DataFrame, results_dir: str, run_tag: str, name: str, index: bool = False) -> str:
+    p = outpath(results_dir, run_tag, name)
+    df.to_csv(p, index=index, encoding="utf-8-sig")
+    log(f"儲存 CSV: {p}")
+    return p
+
+def save_plotly(fig, results_dir: str, run_tag: str, filename_stub: str) -> Dict[str, str]:
+    paths: Dict[str, str] = {}
+    html_path = outpath(results_dir, run_tag, f"{filename_stub}.html")
+    fig.write_html(html_path)
+    paths["html"] = html_path
+    png_path = outpath(results_dir, run_tag, f"{filename_stub}.png")
+    try:
+        fig.write_image(png_path, scale=2)
+        paths["png"] = png_path
+    except Exception:
+        pass
+    return paths
+
+# =========================
+# Data Helpers
+# =========================
+def to_likert_numeric(series: pd.Series) -> pd.Series:
+    if pd.api.types.is_numeric_dtype(series):
+        return series.astype(float)
+    return series.astype(str).str.strip().map(LIKERT5_MAP).astype(float)
+
+def cronbach_alpha(df_items: pd.DataFrame) -> float:
+    df = df_items.dropna(axis=0, how="any")
+    k = df.shape[1]
+    if k < 2 or df.shape[0] < 3: return np.nan
+    item_vars = df.var(axis=0, ddof=1)
+    total_var = df.sum(axis=1).var(ddof=1)
+    if total_var == 0: return np.nan
+    return (k / (k - 1)) * (1 - item_vars.sum() / total_var)
+
+def extract_group(subject_id: str) -> str:
+    if isinstance(subject_id, str) and len(subject_id) > 0:
+        return subject_id.strip()[0].upper()
+    return np.nan
+
+def keep_valid_ids(df: pd.DataFrame, id_col: str) -> pd.DataFrame:
+    pat = re.compile(r"^[AB]\d+")
+    out = df.copy()
+    out[id_col] = out[id_col].astype(str).str.strip()
+    return out[out[id_col].apply(lambda x: bool(pat.match(x)))].copy()
+
+def find_cols_by_prefix(df: pd.DataFrame, prefix: str) -> List[str]:
+    return [c for c in df.columns if isinstance(c, str) and c.startswith(prefix)]
+
+# =========================
+# Scoring
+# =========================
+def score_scales(df: pd.DataFrame, comm_cols, ps_cols, stai_cols, trust_cols, ps_reverse, stai_reverse):
+    out = df.copy()
+    cols_to_num = [c for c in comm_cols+ps_cols+stai_cols+trust_cols if c in out.columns]
+    for c in cols_to_num: out[c] = to_likert_numeric(out[c])
+    for c in [c for c in ps_reverse if c in out.columns]: out[c] = 6 - out[c]
+    for c in [c for c in stai_reverse if c in out.columns]: out[c] = 6 - out[c]
+
+    def row_mean_with_min(x, min_n):
+        v = x.dropna()
+        return float(v.mean()) if len(v) >= min_n else np.nan
+
+    out["comm_eff"] = out[[c for c in comm_cols if c in out.columns]].apply(lambda r: row_mean_with_min(r, 3), axis=1)
+    out["psych_safety"] = out[[c for c in ps_cols if c in out.columns]].apply(lambda r: row_mean_with_min(r, 4), axis=1)
+    out["stai6"] = out[[c for c in stai_cols if c in out.columns]].apply(lambda r: row_mean_with_min(r, 3), axis=1)
+    out["trust_ai"] = out[[c for c in trust_cols if c in out.columns]].apply(lambda r: row_mean_with_min(r, 3), axis=1)
+    return out
+
+# =========================
+# Modeling Helpers
+# =========================
+def extract_model_table(result, outcome, model_type, extra):
+    params = getattr(result, "params", pd.Series(dtype=float))
+    bse = getattr(result, "bse", pd.Series([np.nan]*len(params), index=params.index))
+    pvalues = getattr(result, "pvalues", pd.Series([np.nan]*len(params), index=params.index))
+    try:
+        ci = result.conf_int()
+        low, high = ci.iloc[:, 0], ci.iloc[:, 1]
+    except:
+        low = high = pd.Series([np.nan]*len(params), index=params.index)
+    
+    df = pd.DataFrame({
+        "outcome": outcome, 
+        "model_type": model_type, 
+        "term": params.index, 
+        "coef": params.values, 
+        "se": bse.values, 
+        "pvalue": pvalues.values, 
+        "ci_low": low.values, 
+        "ci_high": high.values
+    })
+    for k, v in extra.items(): df[k] = v
+    return df
+
+def fit_repeated_model(long_df, outcome, warnings_bucket):
+    df = long_df.dropna(subset=[outcome, "group", "time", "id"]).copy()
+    df["time"] = pd.Categorical(df["time"], categories=["pre", "post", "delay"], ordered=True)
+    df["group"] = pd.Categorical(df["group"], categories=["A", "B"], ordered=True)
+    cnt = df.groupby("id")[outcome].count()
+    df = df[df["id"].isin(cnt[cnt >= 2].index)].copy()
+    
+    formula = f"{outcome} ~ C(group, Treatment(reference='A')) * C(time, Treatment(reference='pre'))"
+    methods = ["lbfgs", "powell", "cg", "nm"]
+    for m in methods:
+        try:
+            model = smf.mixedlm(formula, data=df, groups=df["id"], re_formula="1")
+            res = model.fit(reml=False, method=m, maxiter=2000, disp=False)
+            return "MixedLM", res, df, {"optimizer": m, "n_obs": int(res.nobs), "n_subjects": df["id"].nunique()}
+        except Exception as e:
+            warnings_bucket.append(f"MixedLM({outcome},{m}) 失敗: {e}")
+    gee = smf.gee(formula, groups="id", data=df, cov_struct=sm.cov_struct.Exchangeable(), family=sm.families.Gaussian()).fit()
+    return "GEE", gee, df, {"optimizer": "NA", "n_obs": int(gee.nobs), "n_subjects": df["id"].nunique()}
+
+# =========================
+# Plotting 1: Basic Group x Time
+# =========================
+def plot_means_plotly(long_df, outcome, title, filename_stub, results_dir, run_tag):
+    LEGEND_MAP = {"A": "Exp. Group", "B": "Ctrl. Group"}
+    COLOR_MAP = {"Exp. Group": "#B22222", "Ctrl. Group": "#74C0FC"}
+    DASH_MAP = {"Exp. Group": "solid", "Ctrl. Group": "dash"}
+
+    Y_LABEL_MAP = {
+        "psych_safety": "Psychological Safety Score",
+        "stai6": "State Anxiety Score (STAI-6)",
+        "comm_eff": "Communication Self-Efficacy Score"
+    }
+
+    df = long_df.dropna(subset=[outcome, "group"]).copy()
+    df["time"] = pd.Categorical(df["time"], categories=["pre", "post", "delay"], ordered=True)
+
+    summary = (
+        df.groupby(["group", "time"], observed=True)[outcome]
+          .agg(["mean", "count", "std"])
+          .reset_index()
+    )
+    summary["se"] = summary["std"] / np.sqrt(summary["count"])
+    summary["Legend"] = summary["group"].map(LEGEND_MAP)
+
+    fig = px.line(
+        summary, x="time", y="mean", color="Legend", line_dash="Legend",
+        color_discrete_map=COLOR_MAP, line_dash_map=DASH_MAP, error_y="se",
+        markers=True, title=title, category_orders={"Legend": ["Exp. Group", "Ctrl. Group"]}
+    )
+    
+    fig.update_layout(xaxis_title="Time Point", yaxis_title=Y_LABEL_MAP.get(outcome, outcome), legend_title="Group",
+                      font=dict(family="Arial", size=13), plot_bgcolor="white")
+    fig.update_xaxes(showgrid=True, gridcolor='lightgray')
+    fig.update_yaxes(showgrid=True, gridcolor='lightgray')
+
+    save_plotly(fig, results_dir, run_tag, filename_stub)
+
+# =========================
+# Plotting 2: Trust AI Moderation (NEW)
+# =========================
+def plot_trust_moderation(long_df, outcome, title, filename_stub, results_dir, run_tag):
+    # 1. 取得受試者在前測的 Trust AI 分數作為分組基準
+    trust_baseline = long_df[long_df["time"] == "pre"][["id", "trust_ai", "group"]].dropna()
+    
+    # 2. 計算實驗組 (Group A) 的中位數進行分割
+    exp_trust_scores = trust_baseline[trust_baseline["group"] == "A"]["trust_ai"]
+    if exp_trust_scores.empty:
+        log(f"跳過 {outcome} 的信任分組圖：實驗組缺乏 Trust AI 數據")
+        return
+    
+    median_val = exp_trust_scores.median()
+    log(f"Trust AI 中位數分割值: {median_val}")
+
+    # 3. 標記分組標籤
+    def assign_trust_label(row):
+        if row["group"] == "B":
+            return "Ctrl. Group"
+        elif row["group"] == "A":
+            return "Exp. (High Trust)" if row["trust_ai_pre"] >= median_val else "Exp. (Low Trust)"
+        return np.nan
+
+    trust_baseline = trust_baseline.rename(columns={"trust_ai": "trust_ai_pre"}).drop(columns="group")
+    plot_df = long_df.merge(trust_baseline, on="id", how="left")
+    plot_df["Trust_Group"] = plot_df.apply(assign_trust_label, axis=1)
+    plot_df = plot_df.dropna(subset=["Trust_Group", outcome])
+
+    summary = (
+        plot_df.groupby(["Trust_Group", "time"], observed=True)[outcome]
+        .agg(["mean", "count", "std"])
+        .reset_index()
+    )
+    summary["se"] = summary["std"] / np.sqrt(summary["count"])
+
+    COLOR_MAP = {
+        "Exp. (High Trust)": "#B22222",  # 深紅
+        "Exp. (Low Trust)": "#FF7F7F",   # 淺紅 (粉紅)
+        "Ctrl. Group": "#74C0FC"        # 淺藍
+    }
+
+    fig = px.line(
+        summary, x="time", y="mean", color="Trust_Group",
+        error_y="se", markers=True, title=f"{title} by Initial Trust in AI",
+        color_discrete_map=COLOR_MAP,
+        category_orders={"time": ["pre", "post", "delay"], "Trust_Group": ["Exp. (High Trust)", "Exp. (Low Trust)", "Ctrl. Group"]}
+    )
+    
+    fig.update_layout(xaxis_title="Time Point", yaxis_title="Score", legend_title="Group & Trust Level",
+                      plot_bgcolor="white", font=dict(family="Arial", size=13))
+    fig.update_xaxes(showgrid=True, gridcolor='lightgray')
+    fig.update_yaxes(showgrid=True, gridcolor='lightgray')
+
+    save_plotly(fig, results_dir, run_tag, filename_stub)
+
+# =========================
+# Main Execution
+# =========================
+def main(xlsx_path: str):
+    ensure_dir(RESULTS_DIR)
+    run_tag = make_run_tag()
+    log(f"開始分析... 執行標籤: {run_tag}")
+
+    log("Step 1/8 讀取 Excel 分頁...")
+    try:
+        bg = pd.read_excel(xlsx_path, sheet_name="受試者背景")
+        pre = pd.read_excel(xlsx_path, sheet_name="前測").rename(columns={"實驗編號": "id"})
+        post = pd.read_excel(xlsx_path, sheet_name="後測").rename(columns={"您的實驗編號": "id"})
+        delay = pd.read_excel(xlsx_path, sheet_name="延後後測").rename(columns={"您的實驗編號": "id"})
+    except Exception as e:
+        log(f"❌ 讀取 Excel 失敗: {e}")
+        return
+
+    bg = keep_valid_ids(bg, "編號 (A實驗組；B控制組)").rename(columns={"編號 (A實驗組；B控制組)": "id", "身分別": "role"})
+    bg["group"] = bg["id"].apply(extract_group)
+    pre, post, delay = keep_valid_ids(pre, "id"), keep_valid_ids(post, "id"), keep_valid_ids(delay, "id")
+
+    log("Step 2/8 偵測量表題項...")
+    comm_cols = find_cols_by_prefix(pre, "第一部分")
+    ps_cols = find_cols_by_prefix(pre, "第二部分")
+    stai_cols = find_cols_by_prefix(pre, "第三部分")
+    trust_cols = find_cols_by_prefix(pre, "第四部分")
+    ps_reverse = [c for c in ps_cols if any(k in c for k in ["反向", "排斥"])]
+    stai_reverse = [c for c in stai_cols if any(k in c for k in ["反向", "平靜", "放鬆", "滿足"])]
+
+    log("Step 3/8 計算量表得分...")
+    pre_s = score_scales(pre, comm_cols, ps_cols, stai_cols, trust_cols, ps_reverse, stai_reverse)
+    post_s = score_scales(post, comm_cols, ps_cols, stai_cols, trust_cols, ps_reverse, stai_reverse)
+    delay_s = score_scales(delay, comm_cols, ps_cols, stai_cols, trust_cols, ps_reverse, stai_reverse)
+
+    log("Step 4/8 信度分析...")
+    reli = pd.DataFrame([
+        {"scale": "comm_eff", "alpha": cronbach_alpha(pre_s[[c for c in comm_cols if c in pre_s.columns]])},
+        {"scale": "psych_safety", "alpha": cronbach_alpha(pre_s[[c for c in ps_cols if c in pre_s.columns]])},
+        {"scale": "stai6", "alpha": cronbach_alpha(pre_s[[c for c in stai_cols if c in pre_s.columns]])},
+        {"scale": "trust_ai", "alpha": cronbach_alpha(pre_s[[c for c in trust_cols if c in pre_s.columns]])},
+    ])
+    save_df(reli, RESULTS_DIR, run_tag, "reliability_pre.csv")
+
+    log("Step 5/8 資料合併 (Long Format)...")
+    def to_long(df, t):
+        k = df[["id", "comm_eff", "psych_safety", "stai6", "trust_ai"]].copy()
+        k["time"] = t
+        return k
+
+    long_df = pd.concat([to_long(pre_s, "pre"), to_long(post_s, "post"), to_long(delay_s, "delay")], axis=0, ignore_index=True)
+    long_df = long_df.merge(bg[["id", "group", "role"]], on="id", how="left")
+    long_df = long_df[long_df["group"].isin(["A", "B"])].copy()
+    save_df(long_df, RESULTS_DIR, run_tag, "long_df.csv")
+
+    log("Step 6/8 執行統計模型 (MixedLM)...")
+    all_models, warnings_bucket = [], []
+    for outcome in ["stai6", "psych_safety", "comm_eff"]:
+        try:
+            mtype, res, _, meta = fit_repeated_model(long_df, outcome, warnings_bucket)
+            all_models.append(extract_model_table(res, outcome, mtype, meta))
+        except Exception as e:
+            log(f"⚠️ 模型 {outcome} 失敗: {e}")
+
+    if all_models:
+        save_df(pd.concat(all_models), RESULTS_DIR, run_tag, "models.csv")
+
+    log("Step 7/8 產生基礎視覺化圖表...")
+    for outcome, title, stub in [
+        ("psych_safety", "Psychological Safety across Time by Group", "fig_psafety_by_group_time"),
+        ("stai6", "State Anxiety (STAI-6) across Time by Group", "fig_stai6_by_group_time"),
+        ("comm_eff", "Communication Self-Efficacy across Time by Group", "fig_comm_by_group_time"),
+    ]:
+        plot_means_plotly(long_df, outcome, title, stub, RESULTS_DIR, run_tag)
+
+    log("Step 8/8 產生 Trust AI 調節效果分析圖...")
+    for outcome, title, stub in [
+        ("psych_safety", "Psychological Safety", "fig_psafety_moderated_by_trust"),
+        ("stai6", "State Anxiety", "fig_stai6_moderated_by_trust"),
+    ]:
+        plot_trust_moderation(long_df, outcome, title, stub, RESULTS_DIR, run_tag)
+
+    log(f"✅ 分析完成！結果已儲存至 '{RESULTS_DIR}' 資料夾。")
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--xlsx", type=str, default=DEFAULT_XLSX_PATH)
+    args = parser.parse_args()
+    main(args.xlsx)
